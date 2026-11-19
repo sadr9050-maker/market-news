@@ -8,15 +8,35 @@
   تیتر + لینک است (summary_restricted_sources). متن کامل مقاله هرگز کپی نمی‌شود.
 * هیچ پکیجی لازم نیست؛ فقط پایتون ۳.۹+.
 
-راه‌اندازی (کاملاً مرحله‌به‌مرحله در README_FA.md):
-  1) python news_agent.py --setup   ← جادوگر راه‌اندازی: توکن و مقصد را می‌پرسد، تست می‌فرستد و ذخیره می‌کند.
-  2) python news_agent.py --dry-run ← پیش‌نمایش در ترمینال (به تلگرام نمی‌فرستد)
+راه‌اندازی (کاملاً مرحله‌به‌مرحله):
+  1) python news_agent.py --setup      ← جادوگر راه‌اندازی: توکن و مقصد را می‌پرسد، تست می‌فرستد و ذخیره می‌کند.
+  2) python news_agent.py --dry-run    ← پیش‌نمایش در ترمینال (به تلگرام نمی‌فرستد)
   3) python news_agent.py --backfill 3 ← اجرا و ارسال همان لحظهٔ ۳ خبر اخیر
-  4) python news_agent.py           ← اجرای دائمی
+  4) python news_agent.py              ← اجرای دائمی
+  5) python news_agent.py --once       ← فقط یک دور بررسی (برای cron؛ داخل cron هر دقیقه/۲ دقیقه)
+  6) python news_agent.py --selftest   ← تست آفلاین (بدون شبکه)
+  7) python news_agent.py --test-ai    ← تست کلید Anthropic و نام مدل
 
 ⚠ توکن را هرگز جایی منتشر نکن. اگر لو رفت، در BotFather با /revoke عوضش کن.
+
+────────────────────────────────────────────────────────────
+چه چیزی در این نسخه نسبت به نسخهٔ قبل بهتر شده (خلاصه):
+  • حذف تکراری «جهت‌شناس» شد: «Dollar rises…» و «Dollar falls…» دیگر یکی حساب نمی‌شوند.
+  • در شلوغی بازار، خبرهای «مهم» اول صف می‌روند و پنجرهٔ سنیِ بلندتری دارند (high_max_age_minutes).
+  • خطای ارسال سقف دارد (۵ تلاش)؛ دیگر یک خبر مشکل‌دار تا ابد صف را نمی‌بندد.
+  • استیت کامل ذخیره می‌شود (seen + تیترهای اخیر) و با ری‌استارت، حذف تکراری فازی هم برمی‌گردد؛
+    فایل استیت ورژن‌دار و سازگار با فرمت قدیمی است، و با JSON خراب، بی‌صدا صفر نمی‌شود.
+  • حافظهٔ `seen` هرس می‌شود؛ رشد نامحدود در پروسهٔ دائمی ندارد.
+  • قفل فایل (flock): دو نمونهٔ هم‌زمان پست تکراری نمی‌فرستند. + مدیریت SIGTERM (systemd/docker).
+  • لاگ فایل با چرخش + حالت --once برای cron.
+  • خواندن متن مقاله برای کل بچ به‌صورت هم‌زمان (latency از ۸×۱۲s به ~۱۲s).
+  • باگ‌های ترجمه رفع شد: `_tr_google2` دیگر فقط قطعهٔ اول را برنمی‌گرداند، طول متن برای URL سقف دارد.
+  • نام مدل پیش‌فرض Anthropic اصلاح شد و مقدار نامعتبر قبلی به‌صورت خودکار مهاجرت می‌کند. + --test-ai
+  • ساعت خبرها به وقت تهران (display_tz) و بررسی بدنهٔ پاسخ تلگرام (ok:false دیگر «موفق» حساب نمی‌شود).
+  • فیدهای Google News قابل خاموش کردن‌اند (use_google_news) چون از نظر شرایط استفاده پرریسک‌اند.
 """
-import argparse, getpass, hashlib, html, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, getpass, hashlib, html, json, os, re, signal, sys, tempfile, time
+import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -31,6 +51,12 @@ for _s in (sys.stdout, sys.stderr):
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG_FILE = os.path.join(BASE, "news_config.json")
 SEEN_FILE = os.path.join(BASE, "news_seen.json")
+LOCK_FILE = os.path.join(BASE, ".news_agent.lock")
+
+STATE_VERSION = 2
+SEEN_KEEP = 6000        # سقف کلیدهای نگهداری‌شده (هم در حافظه و هم در فایل)
+RECENT_KEEP = 300       # سقف تیترهای اخیر برای حذف تکراری فازی (در فایل ذخیره می‌شود)
+SEND_MAX_FAILS = 5      # بعد از این تعداد خطای ارسال، خبر کنار گذاشته می‌شود
 
 DEFAULTS = {
     "token": "",                 # توکن ربات تلگرام
@@ -38,6 +64,7 @@ DEFAULTS = {
     "poll_seconds": 120,         # هر چند ثانیه فیدها چک شود
     "max_per_cycle": 8,          # حداکثر پیام در هر دور (برای جلوگیری از اسپم)
     "max_age_minutes": 20,       # فقط خبرهای همین چند دقیقهٔ اخیر منتشر می‌شوند (خبر بدون تاریخ منتشر نمی‌شود)
+    "high_max_age_minutes": 90,  # خبرهای «مهم» پنجرهٔ بلندتری دارند تا در شلوغی بازار از دست نروند
     "similar_threshold": 0.6,    # شباهت تیتر برای حذف خبر تکراری (۰ تا ۱)
     "translate": True,           # ترجمهٔ فارسی
     "show_original": False,      # True = تیتر انگلیسی هم بیاید (پیش‌فرض: فقط فارسی)
@@ -46,13 +73,20 @@ DEFAULTS = {
     "summary_chars": 350,        # حداکثر طول چکیده (حرف)
     "fetch_article": True,       # اگر فید چکیده نداشت، ابتدای متن خبر را از صفحهٔ خبر می‌خواند (رایگان)
     "anthropic_key": "",         # اختیاری: با کلید API از Anthropic، چکیدهٔ فارسی هوشمند و کوتاه (۱ تا ۲ جمله) ساخته می‌شود
-    "ai_model": "claude-haiku-5-5",
+    "ai_model": "claude-haiku-4-5",
     "only_high": False,          # True = فقط خبرهای «مهم» (فد، تورم، شوک‌های بازار...) منتشر شود
     "summary_restricted_sources": False,  # True = برای Reuters/FT/Bloomberg هم چکیده منتشر شود (پیش‌فرض: فقط تیتر+لینک)
     "backfill_max_age_minutes": 360,      # پنجرهٔ سن خبر فقط برای --backfill
     "fetch_workers": 8,          # تعداد فیدهای هم‌زمان
-    "extra_feeds": [],           # فید دلخواه: [["اسم", "آدرس"], ...]  (مثلاً فید Investopedia از rss.app)
+    "article_workers": 6,        # تعداد صفحه‌های خبری که هم‌زمان خوانده می‌شوند
+    "use_google_news": True,     # فیدهای news.google.com (تنها راه Reuters/FT بدون API) — خاموش کردنش مجازتر است
+    "display_tz": "Asia/Tehran", # ساعت خبر در پیام؛ "" یا نامعتبر = ساعت سیستم
+    "log_to_file": True,         # لاگ در news_agent.log با چرخش
+    "log_max_bytes": 1000000,
+    "extra_feeds": [],           # فید دلخواه: [["اسم", "آدرس"], ...]
 }
+
+OLD_AI_MODELS = {"", "claude-haiku-5-5"}     # مقدار نامعتبر نسخهٔ قبل
 
 # منابع: FXStreet + Investing.com + Investopedia + Reuters + CNBC + Financial Times + BLS + Bloomberg
 # اگر فیدی کار نکرد خودکار رد می‌شود (فقط یک بار هشدار می‌دهد) و بقیه ادامه می‌دهند.
@@ -142,11 +176,12 @@ CATS = {
                                                   "war", "ceasefire", "missile", "missiles", "airstrike", "airstrikes", "military",
                                                   "middle east", "israel", "geopolitical", "geopolitics", "escalation", "pentagon"]),
 }
+# واژه‌های «عام» که با «مهم» اشتباه می‌شدند حذف شدند: attack / default
 HIGH = ["treasury auction", "treasury refunding", "term premium", "debt ceiling", "bond selloff", "bond sell-off",
         "consumer price index", "employment situation", "unemployment rate", "pce", "fed", "fomc", "powell", "cpi", "payrolls", "nonfarm", "rate hike", "rate cut", "rate decision", "lagarde",
         "ecb", "tariff", "tariffs", "iran", "hormuz", "opec", "recession", "crash", "plunge", "plunges", "soar", "soars",
-        "tumble", "tumbles", "surge", "surges", "record high", "emergency", "shutdown", "default",
-        "war", "ceasefire", "airstrike", "airstrikes", "missile", "missiles", "attack", "escalation", "sanctions",
+        "tumble", "tumbles", "surge", "surges", "record high", "emergency", "shutdown",
+        "war", "ceasefire", "airstrike", "airstrikes", "missile", "missiles", "escalation", "sanctions",
         "vix", "selloff", "sell-off", "rout", "meltdown", "flash crash", "circuit breaker", "circuit breakers", "panic",
         "trading halt", "bloodbath", "yield curve", "10-year yield"]
 
@@ -167,32 +202,78 @@ BIZ_RX = _rx(["shares", "share", "earnings", "stock", "stocks", "revenue", "prof
               "analysts", "upgrade", "downgrade", "iphone", "ipad", "tim cook", "aws", "buyback", "dividend", "market",
               "markets", "nasdaq", "dow", "mastercard", "payments", "insurance", "insurer", "insurers", "wall street"])
 
+# ---------- جهت خبر: برای اینکه «rise» و «fall» اشتباهاً تکراری حساب نشوند ----------
+_UP_WORDS = ["rise", "rises", "rose", "rising", "rally", "rallies", "rallied", "jump", "jumps", "jumped",
+             "soar", "soars", "soared", "surge", "surges", "surged", "gain", "gains", "gained",
+             "climb", "climbs", "climbed", "higher", "advance", "advances", "advanced", "rebound", "rebounds",
+             "beat", "beats", "stronger", "tops", "topped", "record high", "all-time high", "hits record",
+             "jumped", "spikes", "spiked", "rallies"]
+_DOWN_WORDS = ["fall", "falls", "fell", "falling", "drop", "drops", "dropped", "plunge", "plunges", "plunged",
+               "slump", "slumps", "slumped", "tumble", "tumbles", "tumbled", "sink", "sinks", "sank",
+               "slide", "slides", "slid", "decline", "declines", "declined", "lower", "weaker",
+               "miss", "misses", "missed", "dip", "dips", "dipped", "slip", "slips", "slipped", "weakens",
+               "selloff", "sell-off", "rout", "crash", "crashes", "crashed", "retreat", "retreats", "drops"]
+UP_RX = _rx(_UP_WORDS)
+DOWN_RX = _rx(_DOWN_WORDS)
+_UP_TOKEN, _DOWN_TOKEN = "_up_", "_down_"
+
 
 def log(msg):
-    print(datetime.now().strftime("[%H:%M:%S] ") + msg, flush=True)
+    line = datetime.now().strftime("[%H:%M:%S] ") + msg
+    print(line, flush=True)
+    if _LOG_FILE:
+        try:
+            if os.path.exists(_LOG_FILE) and os.path.getsize(_LOG_FILE) > _LOG_MAX:
+                os.replace(_LOG_FILE, _LOG_FILE + ".1")
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d ") + line + "\n")
+        except OSError:
+            pass
+
+
+_LOG_FILE = None
+_LOG_MAX = 1000000
 
 
 # ------------------------- تنظیمات -------------------------
 def load_cfg():
     cfg = dict(DEFAULTS)
-    env_ready = bool(os.environ.get("TG_BOT_TOKEN") and os.environ.get("TG_CHANNEL"))
-    if not os.path.exists(CFG_FILE) and not env_ready:
+    if not os.path.exists(CFG_FILE):
         print("هنوز تنظیماتی وجود ندارد؛ جادوگر راه‌اندازی شروع می‌شود.")
         if not wizard():
             sys.exit("راه‌اندازی کامل نشد. بعد از رفع مشکل دوباره اجرا کن:  python news_agent.py --setup")
-    if os.path.exists(CFG_FILE):
-        try:
-            with open(CFG_FILE, encoding="utf-8") as f:
-                cfg.update(json.load(f))
-        except ValueError as e:
-            sys.exit(f"فایل تنظیمات خراب است ({CFG_FILE}): {e}\nآن را اصلاح یا حذف کن و دوباره --setup را اجرا کن.")
-    for k, ev in (("max_age_minutes", "MAX_AGE_MINUTES"), ("max_per_cycle", "MAX_PER_CYCLE")):
-        if os.environ.get(ev):
-            cfg[k] = int(os.environ[ev])
+    try:
+        with open(CFG_FILE, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except ValueError as e:
+        sys.exit(f"فایل تنظیمات خراب است ({CFG_FILE}): {e}\nآن را اصلاح یا حذف کن و دوباره --setup را اجرا کن.")
+    try:
+        os.chmod(CFG_FILE, 0o600)      # حتی اگر فایل دستی ساخته شده باشد، فقط خودمان بخوانیم
+    except Exception:
+        pass
+    if cfg.get("ai_model") in OLD_AI_MODELS:      # نام مدل نامعتبر نسخهٔ قبل
+        cfg["ai_model"] = DEFAULTS["ai_model"]
     cfg["token"] = os.environ.get("TG_BOT_TOKEN", cfg["token"]).strip()
     cfg["channel"] = os.environ.get("TG_CHANNEL", cfg["channel"]).strip()
     cfg["anthropic_key"] = os.environ.get("ANTHROPIC_API_KEY", cfg.get("anthropic_key", "")).strip()
     return cfg
+
+
+def acquire_lock():
+    """جلوگیری از اجرای دو نمونهٔ هم‌زمان (روی ویندوز نادیده گرفته می‌شود)."""
+    if os.name == "nt":
+        return None
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    f = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("❌ یک نمونهٔ دیگر از ایجنت همین حالا در حال اجراست (قفل: .news_agent.lock).\n"
+                 "   اگر مطمئنی نمونه‌ای در حال اجرا نیست، فایل قفل را پاک کن.")
+    return f
 
 
 # ------------------------- شبکه -------------------------
@@ -293,12 +374,31 @@ def norm(title):
 _STOP = set("a an the of to in on as at for and or is are was were be by with from after before over amid its that this".split())
 
 
+def direction(title):
+    """+1 صعودی، -1 نزولی، 0 خنثی/مبهم. برای اینکه rise/fall تکراری حساب نشوند."""
+    up, down = bool(UP_RX.search(title or "")), bool(DOWN_RX.search(title or ""))
+    if up and not down:
+        return 1
+    if down and not up:
+        return -1
+    return 0
+
+
 def title_tokens(title):
-    return {w for w in re.findall(r"[a-z0-9$%.]+", title.lower()) if w not in _STOP and len(w) > 1}
+    toks = {w for w in re.findall(r"[a-z0-9$%.]+", (title or "").lower()) if w not in _STOP and len(w) > 1}
+    d = direction(title)
+    if d > 0:
+        toks.add(_UP_TOKEN)       # نشانهٔ جهت داخل مجموعهٔ واژه‌ها می‌نشیند
+    elif d < 0:
+        toks.add(_DOWN_TOKEN)
+    return toks
 
 
 def is_similar(a, b, thr):
     if not a or not b:
+        return False
+    # یک خبر صعودی و یک خبر نزولی هرگز «تکراری» نیستند، حتی اگر بقیهٔ واژه‌ها یکی باشند
+    if (_UP_TOKEN in a and _DOWN_TOKEN in b) or (_DOWN_TOKEN in a and _UP_TOKEN in b):
         return False
     inter = len(a & b)
     return inter / len(a | b) >= thr or (inter >= 4 and inter / min(len(a), len(b)) >= 0.8)
@@ -344,6 +444,20 @@ def article_text(url, limit=2500):
     return text[:limit]
 
 
+def prefetch_articles(cfg, batch):
+    """متن همهٔ خبرهای یک بچ را هم‌زمان می‌خواند (به‌جای ۸ بار ۱۲ ثانیه پشت‌سرهم)."""
+    if not (cfg.get("fetch_article") and cfg.get("include_summary")):
+        return
+    need = [it for it in batch
+            if not it.get("_nofetch") and it.get("link") and not it.get("_art")]
+    if not need:
+        return
+    workers = max(1, min(int(cfg.get("article_workers", 6)), len(need)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for it, txt in zip(need, pool.map(lambda x: article_text(x["link"]), need)):
+            it["_art"] = txt or ""
+
+
 def ai_summary(cfg, title, text, source):
     """چکیدهٔ کوتاه فارسی با Claude (اختیاری). در صورت کافی نبودن متن، رشتهٔ خالی."""
     system = ("تو دستیار خبری یک کانال بازارهای مالی هستی. از روی تیتر و متن خبر انگلیسی، یک چکیدهٔ فارسی روان و کوتاه بنویس: "
@@ -377,8 +491,10 @@ def get_summary(cfg, it):
     summ = make_summary(it["desc"], it["title"], cfg["summary_chars"])
     base = it["desc"]
     use_ai = bool(cfg.get("anthropic_key"))
+    art = it.get("_art") or ""       # معمولاً از قبل و به‌صورت هم‌زمان گرفته شده
     if (not summ or use_ai) and cfg.get("fetch_article") and it["link"] and not it.get("_nofetch"):
-        art = article_text(it["link"])
+        if not art:
+            art = article_text(it["link"])
         if art:
             if len(art) > len(base):
                 base = art
@@ -406,34 +522,51 @@ def get_summary(cfg, it):
 _tr_cache = {}
 
 
+def _clip_text(text, n=1000):
+    """سقف طول متن برای URL سرویس‌های ترجمه (محدودیت ~۲KB گوگل)."""
+    text = (text or "").strip()
+    if len(text) <= n:
+        return text
+    cut = text[:n]
+    m = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return cut[:m + 1] if m > n * 0.4 else cut.rsplit(" ", 1)[0]
+
+
 def _tr_google(text):
-    url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=fa&dt=t&q=" + urllib.parse.quote(text)
+    url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=fa&dt=t&q=" + urllib.parse.quote(_clip_text(text))
     data = json.loads(fetch(url, timeout=10).decode("utf-8"))
     return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
 
 
 def _tr_google2(text):
-    url = "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=fa&q=" + urllib.parse.quote(text)
+    url = "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=fa&q=" + urllib.parse.quote(_clip_text(text))
     data = json.loads(fetch(url, timeout=10).decode("utf-8"))
-    if isinstance(data, list) and data:
-        first = data[0]
-        return (first[0] if isinstance(first, list) else first).strip()
-    return ""
+    if not isinstance(data, list) or not data:
+        return ""
+    first = data[0]
+    if isinstance(first, str):                    # پاسخ تک‌رشته‌ای
+        return first.strip()
+    # پاسخ چندقطعه‌ای: همهٔ قطعه‌ها باید به هم چسبانده شوند (باگ نسخهٔ قبل: فقط قطعهٔ اول)
+    return "".join(seg[0] for seg in data if isinstance(seg, list) and seg and isinstance(seg[0], str)).strip()
 
 
 def _tr_lingva(text):
-    url = "https://lingva.ml/api/v1/en/fa/" + urllib.parse.quote(text, safe="")
+    url = "https://lingva.ml/api/v1/en/fa/" + urllib.parse.quote(_clip_text(text), safe="")
     return json.loads(fetch(url, timeout=12).decode("utf-8")).get("translation", "").strip()
 
 
 def _tr_mymemory(text):
-    url = "https://api.mymemory.translated.net/get?langpair=en|fa&q=" + urllib.parse.quote(text[:450])
+    url = "https://api.mymemory.translated.net/get?langpair=en|fa&q=" + urllib.parse.quote(_clip_text(text)[:450])
     data = json.loads(fetch(url, timeout=10).decode("utf-8"))
     return html.unescape(data.get("responseData", {}).get("translatedText", "")).strip()
 
 
 def _has_persian(t):
-    return len(re.findall(r"[\u0600-\u06FF]", t or "")) >= max(3, len(t or "") // 5)
+    t = t or ""
+    if not t:
+        return False
+    persian = len(re.findall(r"[\u0600-\u06FF]", t))
+    return persian >= 3 and persian >= len(t) / 6
 
 
 class TranslateDown(RuntimeError):
@@ -451,7 +584,7 @@ def translate_fa(text):
     if time.time() < _tr_down_until:
         raise TranslateDown("سرویس‌های ترجمه موقتاً کنار گذاشته شده‌اند")
     last = None
-    for attempt in range(2):
+    for _ in range(2):
         for fn in (_tr_google, _tr_google2, _tr_lingva, _tr_mymemory):
             try:
                 res = fn(text)
@@ -472,22 +605,61 @@ def esc(s):
     return html.escape(s, quote=False)
 
 
-def build_message(it, cats, high, fa, show_orig, source, summary=""):
+# اگر zoneinfo/tzdata روی سیستم نبود (مثلاً بعضی ویندوزها یا کانتینرهای مینیمال)، این افست‌های ثابت جایگزین می‌شوند.
+# ایران از ۱۴۰۱ ساعت تابستانی ندارد؛ همیشه UTC+03:30.
+_FIXED_TZ = {"asia/tehran": (3, 30), "iran": (3, 30), "utc": (0, 0), "europe/berlin": (1, 0), "europe/london": (0, 0)}
+
+
+def local_time(dt, tzname):
+    """ساعت خبر به وقت نمایش (پیش‌فرض تهران)؛ اگر zoneinfo نبود، افست ثابت؛ در نهایت ساعت سیستم."""
+    if not dt:
+        return ""
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            return dt.astimezone(ZoneInfo(tzname)).strftime("%H:%M")
+        except Exception:
+            pass
+        fx = _FIXED_TZ.get(tzname.strip().lower())
+        if fx:
+            from datetime import timedelta
+            return dt.astimezone(timezone(timedelta(hours=fx[0], minutes=fx[1]))).strftime("%H:%M")
+    return dt.astimezone().strftime("%H:%M")
+
+
+RLM = "\u200f"      # علامت راست‌به‌چپ (نامرئی)
+# هر قطعهٔ لاتین (نام شرکت، عدد، $، %، ...) که وسط یا ابتدای متن فارسی آمده است
+_LATIN_RUN = re.compile(r"[A-Za-z0-9$%][A-Za-z0-9$%.,'’&/+\-:()#@ ]*[A-Za-z0-9$%)]|[A-Za-z0-9$%]")
+
+
+def fix_rtl(text):
+    """متن فارسیِ دارای کلمات انگلیسی را در تلگرام درست نمایش می‌دهد.
+    مشکل: اگر خط با کلمهٔ انگلیسی (مثل TD Cowen) شروع شود، تلگرام کل خط را چپ‌به‌راست می‌چیند و جملهٔ فارسی به‌هم می‌ریزد.
+    راه‌حل: یک RLM اول خط، و یک RLM بعد از هر قطعهٔ لاتین تا علامت‌ها و اعداد بعدی جابه‌جا نشوند.
+    (فقط روی متن‌های فارسی اعمال می‌شود.)"""
+    if not text or not _has_persian(text):
+        return text
+    text = text.replace(RLM, "")
+    return RLM + _LATIN_RUN.sub(lambda m: m.group(0) + RLM, text)
+
+
+def build_message(it, cats, high, fa, show_orig, source, summary="", tzname=None):
     labels = " ".join(f"{CATS[c][0]} {CATS[c][1]}" for c in cats)
     tags = " ".join(CATS[c][2] for c in cats)
     head = ("🔴 مهم | " if high else "") + labels
-    lines = [head, "", f"<b>{esc(fa or it['title'])}</b>"]
+    title_txt = fix_rtl(fa) if fa else it["title"]      # فقط ترجمهٔ فارسی؛ تیتر انگلیسی اصلی دست نمی‌خورد
+    lines = [RLM + head, "", f"{RLM if fa else ''}<b>{esc(title_txt)}</b>"]
     if show_orig and fa and fa != it["title"]:
         lines.append(f"<i>{esc(it['title'])}</i>")
     if summary:
         lines.append("")
-        lines.append(esc(summary))
-    when = it["date"].astimezone().strftime("%H:%M") if it["date"] else ""
+        lines.append(esc(fix_rtl(summary)))
+    when = local_time(it["date"], tzname)
     lines.append("")
     lines.append(f"📰 {esc(source)}" + (f" · 🕒 {when}" if when else ""))
     if it["link"]:
         lines.append(f'🔗 <a href="{html.escape(it["link"], quote=True)}">لینک خبر</a>')
-    lines.append(tags)
+    lines.append(RLM + tags)
     return "\n".join(lines)
 
 
@@ -514,6 +686,8 @@ def explain_tg_error(desc):
         return "مقصد پیدا نشد: یوزرنیم کانال را اشتباه نوشته‌ای، یا ربات هنوز در آن کانال ادمین نیست."
     if "not enough rights" in d or "administrator" in d or "member of the channel" in d:
         return "ربات در کانال ادمین نیست یا اجازهٔ Post Messages ندارد."
+    if "message is too long" in d:
+        return "متن پیام از سقف ۴۰۹۶ کاراکتر تلگرام بیشتر شد؛ summary_chars را کمتر کن."
     if "unauthorized" in d or "not found" == d.strip():
         return "توکن اشتباه است. دوباره از BotFather کپی کن (کامل، با «:» وسطش)."
     if "اتصال" in d or "timed out" in d or "urlopen" in d:
@@ -594,8 +768,18 @@ def send_telegram(token, channel, text):
     last = "نامشخص"
     for _ in range(3):
         try:
-            fetch(url, timeout=20, data=body)
-            return True
+            raw = fetch(url, timeout=20, data=body).decode("utf-8", "ignore")
+            try:
+                j = json.loads(raw)
+            except ValueError:
+                return True          # پاسخ غیر JSON ولی HTTP موفق
+            if j.get("ok"):
+                return True
+            last = str(j.get("description", "ok=false"))
+            if "too many requests" in last.lower():      # 429 با بدنهٔ 200
+                time.sleep(int(j.get("parameters", {}).get("retry_after", 5)) + 1)
+                continue
+            raise RuntimeError(f"تلگرام خطا داد: {last}")
         except urllib.error.HTTPError as e:
             try:
                 j = json.loads(e.read().decode())
@@ -612,40 +796,76 @@ def send_telegram(token, channel, text):
     raise RuntimeError(f"ارسال به تلگرام ناموفق بود: {last}")
 
 
-# ------------------------- ذخیرهٔ دیده‌شده‌ها -------------------------
-def load_seen():
+# ------------------------- استیت (دیده‌شده‌ها + تیترهای اخیر) -------------------------
+def load_state(path=None):
+    """(seen, recent) — سازگار با فرمت قدیمی (فقط لیست کلیدها). recent = لیست مجموعهٔ واژه‌ها."""
+    path = path or SEEN_FILE
     try:
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, []
+    except Exception as e:  # JSON خراب: بی‌صدا صفر نکن، نسخهٔ خراب را کنار بگذار
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
+            pass
+        log(f"⚠ فایل وضعیت خوانده نشد ({str(e)[:80]})؛ نسخهٔ خراب به {os.path.basename(path)}.corrupt منتقل شد.")
+        return None, []
+    if isinstance(data, list):            # فرمت قدیمی
+        return data, []
+    seen = data.get("seen") or []
+    recent = [set(t) for t in (data.get("recent") or []) if isinstance(t, list)]
+    return seen, recent[-RECENT_KEEP:]
 
 
-def save_seen(seen):
-    with open(SEEN_FILE + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(seen[-6000:], f)
-    os.replace(SEEN_FILE + ".tmp", SEEN_FILE)
+def save_state(seen, recent, path=None):
+    path = path or SEEN_FILE
+    payload = {"version": STATE_VERSION,
+               "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "seen": seen[-SEEN_KEEP:],
+               "recent": [sorted(t) for t in recent[-RECENT_KEEP:]]}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def prune(seen):
+    """جلوگیری از رشد نامحدود حافظه در اجرای طولانی."""
+    if len(seen) > SEEN_KEEP + 2000:
+        del seen[:-SEEN_KEEP]
 
 
 # ------------------------- یک دور بررسی -------------------------
 _warned = set()
 _tr_fails = {}
+_send_fails = {}
+
+
+def _mark_seen(seen, it):
+    seen.extend(it["_keys"])
 
 
 def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent=None, save_fn=None):
     """seen: لیست کلیدها (تغییر می‌کند). خروجی: تعداد پیام‌های ارسال‌شده"""
     get_feed = get_feed or (lambda url: parse_feed(fetch(url)))
     seen_set = set(seen)
-    recent = recent if recent is not None else []      # توکن تیترهای منتشرشده (برای تکراری فازی)
+    recent = recent if recent is not None else []      # مجموعهٔ واژه‌های تیترهای منتشرشده (برای تکراری فازی)
     thr = cfg.get("similar_threshold", 0.6)
     now = datetime.now(timezone.utc)
     fresh, ok_feeds = [], 0
+
     all_feeds = list(FEEDS) + [tuple(x) for x in cfg.get("extra_feeds", []) if len(x) == 2]
+    if not cfg.get("use_google_news", True):          # فیدهای گوگل قابل خاموش کردن‌اند
+        all_feeds = [f for f in all_feeds if "news.google.com" not in f[1]]
+
     def _load(nu):
         try:
             return nu, get_feed(nu[1]), None
         except Exception as e:  # noqa
             return nu, None, e
+
     with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("fetch_workers", 8)))) as pool:
         loaded = list(pool.map(_load, all_feeds))      # فیدها هم‌زمان خوانده می‌شوند (ترتیب حفظ می‌شود)
     for (name, url), items, err in loaded:
@@ -686,7 +906,9 @@ def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent
         toks.append(t)
         uniq.append(it)
     uniq.sort(key=lambda x: x["date"] or now)
-    max_age = cfg.get("backfill_max_age_minutes", 360) if (first and backfill) else cfg["max_age_minutes"]
+
+    base_age = cfg.get("backfill_max_age_minutes", 360) if (first and backfill) else cfg["max_age_minutes"]
+    high_age = max(base_age, cfg.get("high_max_age_minutes", base_age))
     relevant = []
     for it in uniq:
         cats, high = classify(it["title"], cfg["include_dow_stocks"])
@@ -695,28 +917,36 @@ def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent
                 cats.append("macro")
             high = True
         age_min = (now - it["date"]).total_seconds() / 60 if it["date"] else 10**6   # بدون تاریخ = منتشر نشود
-        if not cats or age_min > max_age or age_min < -10 or (cfg.get("only_high") and not high):
+        window = high_age if high else base_age     # خبر «مهم» در شلوغی بازار زودتر از دست نمی‌رود
+        if not cats or age_min > window or age_min < -10 or (cfg.get("only_high") and not high):
             seen.extend(it["_keys"])
             continue
         it["_cats"], it["_high"] = cats, high
         relevant.append(it)
+
     if first:   # اولین اجرا: چیزی منتشر نمی‌کنیم مگر backfill خواسته باشد
         for it in relevant[:-backfill] if backfill else relevant:
             seen.extend(it["_keys"])
         relevant = relevant[-backfill:] if backfill else []
+
+    # صف ارسال: مهم‌ترین و تازه‌ترین اول (قبلاً ترتیب فقط زمانی بود و خبر مهم می‌توانست جا بماند)
+    queue = sorted(relevant, key=lambda x: (not x["_high"], -(x["date"] or now).timestamp()))
+    batch = queue[: cfg["max_per_cycle"]]
+    prefetch_articles(cfg, batch)      # متن خبرها هم‌زمان، نه پشت‌سرهم
+
     sent = 0
-    for it in relevant[: cfg["max_per_cycle"]]:
+    for it in batch:
         fa = None
         if cfg["translate"]:
             try:
                 fa = translate_fa(it["title"])
-            except TranslateDown as e:
+            except TranslateDown:
                 log("سرویس ترجمه موقتاً در دسترس نیست؛ بقیهٔ خبرها دور بعد بررسی می‌شوند.")
                 break
             except Exception as e:  # noqa
                 k0 = it["_keys"][0]
                 _tr_fails[k0] = _tr_fails.get(k0, 0) + 1
-                if _tr_fails[k0] >= 5:           # یک تیتر مشکل‌دار نباید صف را برای همیشه ببندد
+                if _tr_fails[k0] >= SEND_MAX_FAILS:      # یک تیتر مشکل‌دار نباید صف را برای همیشه ببندد
                     seen.extend(it["_keys"])
                     _tr_fails.pop(k0, None)
                     log("این خبر بعد از ۵ بار ترجمهٔ ناموفق کنار گذاشته شد.")
@@ -724,19 +954,28 @@ def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent
                 log(f"ترجمه ناموفق، این خبر فعلاً ارسال نمی‌شود: {str(e)[:60]}")
                 continue
         summ = get_summary(cfg, it)
-        msg = build_message(it, it["_cats"], it["_high"], fa, cfg["show_original"], it["_src"], summ)
+        msg = build_message(it, it["_cats"], it["_high"], fa, cfg["show_original"], it["_src"], summ,
+                            cfg.get("display_tz"))
         try:
             post_fn(msg)
         except Exception as e:  # noqa
-            log(f"ارسال ناموفق ({str(e)[:100]}) {explain_tg_error(str(e))}")   # علامت نمی‌خورد؛ دور بعد دوباره تلاش می‌شود
+            k0 = it["_keys"][0]
+            _send_fails[k0] = _send_fails.get(k0, 0) + 1
+            log(f"ارسال ناموفق ({str(e)[:100]}) {explain_tg_error(str(e))}")
+            if _send_fails[k0] >= SEND_MAX_FAILS:        # سقف تلاش: خبر سمی صف را تا ابد معطل نمی‌کند
+                seen.extend(it["_keys"])
+                _send_fails.pop(k0, None)
+                log("این خبر بعد از ۵ بار ارسال ناموفق کنار گذاشته شد.")
             continue
+        _send_fails.pop(it["_keys"][0], None)
         seen.extend(it["_keys"])
         recent.append(it["_tok"])
-        del recent[:-300]
+        del recent[:-RECENT_KEEP]
         if save_fn:
             save_fn()          # بلافاصله ذخیره می‌شود تا با کرش/ری‌استارت تکراری نرود
         sent += 1
         time.sleep(3)   # فاصله بین پیام‌ها
+    prune(seen)
     if ok_feeds == 0:
         log("هیچ فیدی در دسترس نبود (اینترنت/فیلترشکن؟)")
     return sent
@@ -744,12 +983,14 @@ def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent
 
 # ------------------------- اجرا -------------------------
 def main():
+    global _LOG_FILE, _LOG_MAX
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="ارسال یک پیام تست به کانال")
     ap.add_argument("--dry-run", action="store_true", help="فقط چاپ در ترمینال (ارسال نمی‌کند)")
     ap.add_argument("--backfill", type=int, default=0, help="در اولین اجرا N خبر آخر را هم منتشر کن")
     ap.add_argument("--setup", action="store_true", help="اجرای دوبارهٔ جادوگر راه‌اندازی (توکن/کانال)")
-    ap.add_argument("--once", action="store_true", help="فقط یک دور بررسی و خروج (برای GitHub Actions / cron)")
+    ap.add_argument("--once", action="store_true", help="فقط یک دور بررسی و خروج (برای cron)")
+    ap.add_argument("--test-ai", action="store_true", help="تست کلید و نام مدل Anthropic")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -757,11 +998,29 @@ def main():
     if a.setup:
         sys.exit(0 if wizard() else 1)
     cfg = load_cfg()
+    if cfg.get("log_to_file"):
+        _LOG_FILE = os.path.join(BASE, "news_agent.log")
+        _LOG_MAX = int(cfg.get("log_max_bytes", 1000000))
+
+    if a.test_ai:
+        if not cfg.get("anthropic_key"):
+            sys.exit("کلید Anthropic تنظیم نشده است. ANTHROPIC_API_KEY را ست کن یا در news_config.json بگذار.")
+        try:
+            out = ai_summary(cfg, "Gold rises as CPI cools",
+                             "Spot gold rose 1% on Tuesday after US consumer prices cooled more than expected.", "test")
+        except Exception as e:
+            sys.exit(f"❌ تست ناموفق: {e}\n   اگر خطا 404 است، نام ai_model را بررسی کن (پیش‌فرض: {DEFAULTS['ai_model']}).")
+        print("✅ مدل پاسخ داد:", out or "(NONE)")
+
     if a.dry_run:
         def post(m):
             print("-" * 50 + "\n" + re.sub(r"<[^>]+>", "", html.unescape(m)))
-        seen = []
-        n = run_cycle(cfg, seen, post)
+        seen, recent = load_state()
+        # بدون فایل وضعیت، پیش‌نمایش باید چند خبر نشان دهد (نه اینکه همه را فقط علامت بزند)
+        bf = a.backfill or (0 if seen is not None else cfg["max_per_cycle"])
+        first = seen is None
+        seen, recent = seen or [], recent or []
+        n = run_cycle(cfg, seen, post, first=first, backfill=bf, recent=recent)
         log(f"پایان پیش‌نمایش: {n} خبر.")
         return
     if not cfg["token"] or not cfg["channel"]:
@@ -775,21 +1034,38 @@ def main():
             sys.exit(f"{e}\nراهنما: {explain_tg_error(str(e)) or 'python news_agent.py --setup را اجرا کن.'}")
         log("پیام تست ارسال شد؛ کانال را ببین.")
         return
-    seen = load_seen()
+
+    lock = acquire_lock()          # دو نمونهٔ هم‌زمان = پست تکراری؛ جلوگیری می‌کنیم
+    seen, recent = load_state()
     first = seen is None
     if a.backfill > 0:
         if not first:
             log("--backfill: فهرست خبرهای دیده‌شدهٔ قبلی نادیده گرفته شد؛ ممکن است چند خبر اخیر تکراری شوند.")
-        seen, first = [], True
+        seen, recent, first = [], [], True
     seen = seen or []
+    recent = recent or []
     post = lambda m: send_telegram(cfg["token"], cfg["channel"], m)  # noqa
-    recent = []
-    save = lambda: save_seen(seen)  # noqa
+    save = lambda: save_state(seen, recent)  # noqa
+
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _on_term)      # systemd/docker: استیت قبل از خروج ذخیره شود
+    except (ValueError, AttributeError):
+        pass
+
     if a.once:
-        n = run_cycle(cfg, seen, post, first=first, backfill=a.backfill, recent=recent, save_fn=save)
-        save_seen(seen)
-        log(f"دور یک‌باره تمام شد: {n} خبر ارسال شد.")
+        try:
+            n = run_cycle(cfg, seen, post, first=first, backfill=a.backfill, recent=recent, save_fn=save)
+            save_state(seen, recent)
+            log(f"{n} خبر ارسال شد.")
+        except KeyboardInterrupt:
+            save_state(seen, recent)
+        except Exception as e:  # noqa
+            save_state(seen, recent)
+            sys.exit(f"خطا: {e}  {explain_tg_error(str(e))}")
         return
+
     log(f"ایجنت خبری شروع شد | هر {cfg['poll_seconds']} ثانیه | Ctrl+C = توقف")
     if first and not a.backfill:
         log("اولین اجرا: خبرهای فعلی فقط علامت‌گذاری می‌شوند و از خبرهای جدید شروع می‌کنم.")
@@ -797,11 +1073,11 @@ def main():
         try:
             n = run_cycle(cfg, seen, post, first=first, backfill=a.backfill, recent=recent, save_fn=save)
             first = False
-            save_seen(seen)
+            save_state(seen, recent)
             if n:
                 log(f"{n} خبر ارسال شد.")
         except KeyboardInterrupt:
-            save_seen(seen)
+            save_state(seen, recent)
             log("متوقف شد.")
             return
         except Exception as e:  # noqa
@@ -809,7 +1085,7 @@ def main():
         try:
             time.sleep(cfg["poll_seconds"])
         except KeyboardInterrupt:
-            save_seen(seen)
+            save_state(seen, recent)
             log("متوقف شد.")
             return
 
@@ -854,6 +1130,42 @@ def selftest():
     mt = (b'<rss xmlns:media="http://search.yahoo.com/mrss/"><channel><item><title>Gold jumps</title>'
           b'<media:title>Cap</media:title><link>http://a</link></item></channel></rss>')
     assert parse_feed(mt)[0]["title"] == "Gold jumps"
+
+    # --- جهت خبر: صعودی و نزولی با تیتر تقریباً یکسان نباید «تکراری» شوند ---
+    assert direction("Dollar rises after Fed decision") == 1
+    assert direction("Dollar falls after Fed decision") == -1
+    assert direction("Gold steady ahead of CPI") == 0
+    up = title_tokens("Dollar rises after Fed decision")
+    dn = title_tokens("Dollar falls after Fed decision")
+    assert up & {_UP_TOKEN} and dn & {_DOWN_TOKEN}
+    assert not is_similar(up, dn, 0.6), "خبر صعودی و نزولی نباید تکراری حساب شود"
+    assert is_similar(title_tokens("Gold jumps as CPI cools"), title_tokens("Gold jumps as CPI cools today"), 0.6)
+    assert not is_similar(up, title_tokens("Microsoft earnings beat estimates"), 0.6)
+
+    # --- ساعت به وقت تهران، مستقل از ساعت سیستم (مثلاً UTC در گیت‌هاب) ---
+    assert local_time(datetime(2026, 11, 19, 14, 30, tzinfo=timezone.utc), "Asia/Tehran") == "18:00"
+
+    # --- راست‌به‌چپ: خط فارسیِ شروع‌شده با کلمهٔ انگلیسی باید با RLM شروع شود ---
+    t = fix_rtl("TD Cowen مجدداً خرید سهام والمارت را تکرار می‌کند و قیمت هدف 125 دلار را حفظ می‌کند")
+    assert t.startswith(RLM) and "TD Cowen" + RLM in t and "125" + RLM in t and t.count(RLM) == 3, repr(t)
+    assert fix_rtl("Only English headline") == "Only English headline"
+    assert fix_rtl(fix_rtl("TD Cowen والمارت را خرید")) == fix_rtl("TD Cowen والمارت را خرید")      # idempotent
+
+    # --- استیت: رفت‌وبرگشت و سازگاری با فرمت قدیمی ---
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "s.json")
+        save_state(["a", "b"], [title_tokens("Gold rises now")], path=p)
+        s2, r2 = load_state(p)
+        assert s2 == ["a", "b"] and r2 and _UP_TOKEN in r2[0]
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(["old1", "old2"], f)          # فرمت قدیمی
+        s3, r3 = load_state(p)
+        assert s3 == ["old1", "old2"] and r3 == []
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        s4, r4 = load_state(p)
+        assert s4 is None and r4 == [] and os.path.exists(p + ".corrupt")
+
     cfg = dict(DEFAULTS, max_age_minutes=60, show_original=True, fetch_article=False)
     sent, seen = [], []
     real_tr, real_sleep = translate_fa, time.sleep
@@ -885,6 +1197,7 @@ def selftest():
         assert run_cycle(cfg, seen3, sent.append, get_feed=gf) == 4  # دور بعد همه ارسال می‌شوند
         assert make_summary("Short.", "x", 300) == ""
         assert len(make_summary("A sentence here. " * 40, "x", 100)) <= 101
+        assert _clip_text("x " * 2000)[-1] != " " and len(_clip_text("x " * 2000)) <= 1001
     finally:
         translate_fa, time.sleep = real_tr, real_sleep
     print("selftest OK")
