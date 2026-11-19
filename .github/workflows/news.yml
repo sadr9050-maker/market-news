@@ -38,7 +38,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_AGE_MINUTES: "45"
           MAX_PER_CYCLE: "10"
-        run: python news_agent.py --test
+        run: python news_agent.py --once
 
       - name: Save seen-state
         if: always()
