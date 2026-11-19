@@ -1,0 +1,48 @@
+name: market-news-agent
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: news-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore seen-state
+        uses: actions/cache/restore@v4
+        with:
+          path: news_seen.json
+          key: seen-${{ github.run_id }}
+          restore-keys: |
+            seen-
+
+      - name: Run agent once
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL: ${{ secrets.TG_CHANNEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAX_AGE_MINUTES: "45"
+          MAX_PER_CYCLE: "10"
+        run: python news_agent.py --once
+
+      - name: Save seen-state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: news_seen.json
+          key: seen-${{ github.run_id }}
