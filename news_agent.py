@@ -34,12 +34,14 @@
   • نام مدل پیش‌فرض Anthropic اصلاح شد و مقدار نامعتبر قبلی به‌صورت خودکار مهاجرت می‌کند. + --test-ai
   • ساعت خبرها به وقت تهران (display_tz) و بررسی بدنهٔ پاسخ تلگرام (ok:false دیگر «موفق» حساب نمی‌شود).
   • فیدهای Google News قابل خاموش کردن‌اند (use_google_news) چون از نظر شرایط استفاده پرریسک‌اند.
+  • Yahoo Finance هم به منابع اضافه شد (طلا، نقره، نفت، داو، نزدک، S&P، بیت‌کوین، دلار، پوند، دلار کانادا).
+  • تحلیل روزانه با Claude در کد هست ولی پیش‌فرض خاموش است (analysis_enabled)؛ برای روشن کردنش کلید Anthropic لازم است.
 """
 import argparse, getpass, hashlib, html, json, os, re, signal, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 for _s in (sys.stdout, sys.stderr):
@@ -65,7 +67,7 @@ DEFAULTS = {
     "max_per_cycle": 8,          # حداکثر پیام در هر دور (برای جلوگیری از اسپم)
     "max_age_minutes": 20,       # فقط خبرهای همین چند دقیقهٔ اخیر منتشر می‌شوند (خبر بدون تاریخ منتشر نمی‌شود)
     "high_max_age_minutes": 90,  # خبرهای «مهم» پنجرهٔ بلندتری دارند تا در شلوغی بازار از دست نروند
-    "similar_threshold": 0.6,    # شباهت تیتر برای حذف خبر تکراری (۰ تا ۱)
+    "similar_threshold": 0.5,    # شباهت تیتر برای حذف خبر تکراری (۰ تا ۱)؛ کمتر = سخت‌گیرتر در حذف تکراری
     "translate": True,           # ترجمهٔ فارسی
     "show_original": False,      # True = تیتر انگلیسی هم بیاید (پیش‌فرض: فقط فارسی)
     "include_dow_stocks": True,  # خبر شرکت‌های داو (اپل، مایکروسافت، انویدیا، ...)
@@ -84,6 +86,16 @@ DEFAULTS = {
     "log_to_file": True,         # لاگ در news_agent.log با چرخش
     "log_max_bytes": 1000000,
     "extra_feeds": [],           # فید دلخواه: [["اسم", "آدرس"], ...]
+    # --- تحلیل فاندامنتال روزانه (نیاز به کلید Anthropic) ---
+    "analysis_enabled": False,                # True = تحلیل روزانه با Claude (پولی، نیاز به کلید Anthropic). پیش‌فرض: خاموش
+    "analysis_times": ["10:00", "15:00"],     # ساعت‌های ارسال (به وقت analysis_tz)
+    "analysis_tz": "Asia/Tehran",
+    "analysis_grace_minutes": 90,             # اگر اجرای زمان‌بندی‌شده دیر شروع شد، تا این‌قدر بعد از ساعت مقرر هنوز ارسال می‌شود
+    "analysis_model": "",                     # خالی = همان ai_model؛ برای کیفیت بیشتر می‌توانی مدل قوی‌تری بگذاری
+    "analysis_web_search": False,             # True = Claude قیمت‌ها و خبرهای روز را با جستجوی وب هم می‌خواند (گران‌تر)
+    "analysis_web_searches": 6,               # سقف تعداد جستجو در هر تحلیل (فقط وقتی analysis_web_search روشن است)
+    "analysis_headlines_per_asset": 8,        # تعداد تیتر ۲۴ ساعت اخیر برای هر دارایی
+    "ai_news_summary": True,                  # False = کلید Anthropic فقط برای تحلیل روزانه باشد و برای چکیدهٔ تک‌تک خبرها خرج نشود
 }
 
 OLD_AI_MODELS = {"", "claude-haiku-5-5"}     # مقدار نامعتبر نسخهٔ قبل
@@ -127,6 +139,18 @@ FEEDS = [
     ("BLS CPI",              "https://www.bls.gov/feed/cpi.rss"),
     ("BLS Jobs",             "https://www.bls.gov/feed/empsit.rss"),
     ("BLS PPI",              "https://www.bls.gov/feed/ppi.rss"),
+    # --- Yahoo Finance (فیدهای خبری شاخص‌ها و دارایی‌ها؛ فید عمومی rssindex از اکتبر ۲۰۲۶ خراب است) ---
+    ("Yahoo Finance",    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=GC=F&region=US&lang=en-US"),
+    ("Yahoo Finance",  "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SI=F&region=US&lang=en-US"),
+    ("Yahoo Finance",     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=CL=F&region=US&lang=en-US"),
+    ("Yahoo Finance",     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EDJI&region=US&lang=en-US"),
+    ("Yahoo Finance",  "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EIXIC&region=US&lang=en-US"),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US"),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=BTC-USD&region=US&lang=en-US"),
+    ("Yahoo Finance",  "https://feeds.finance.yahoo.com/rss/2.0/headline?s=DX-Y.NYB&region=US&lang=en-US"),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=GBPUSD=X&region=US&lang=en-US"),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=USDCAD=X&region=US&lang=en-US"),
+    ("Yahoo Finance", "https://news.google.com/rss/search?q=when:1d+site:finance.yahoo.com/economy&hl=en-US&gl=US&ceid=US:en"),
     # --- Bloomberg ---
     ("Bloomberg",            "https://feeds.bloomberg.com/markets/news.rss"),
     ("Bloomberg Economics",  "https://feeds.bloomberg.com/economics/news.rss"),
@@ -256,6 +280,8 @@ def load_cfg():
     cfg["token"] = os.environ.get("TG_BOT_TOKEN", cfg["token"]).strip()
     cfg["channel"] = os.environ.get("TG_CHANNEL", cfg["channel"]).strip()
     cfg["anthropic_key"] = os.environ.get("ANTHROPIC_API_KEY", cfg.get("anthropic_key", "")).strip()
+    if os.environ.get("NEWS_AI_SUMMARY", "").strip().lower() in ("0", "false", "no"):
+        cfg["ai_news_summary"] = False
     return cfg
 
 
@@ -384,8 +410,43 @@ def direction(title):
     return 0
 
 
+# هم‌معنی‌هایی که رسانه‌ها برای یک خبر به‌جای هم می‌نویسند (قبل از مقایسه یکی می‌شوند)
+_SYN = {"reiterates": "maintain", "reiterated": "maintain", "maintains": "maintain", "maintained": "maintain",
+        "keeps": "maintain", "kept": "maintain", "retains": "maintain", "retained": "maintain", "holds": "maintain",
+        "lifts": "raise", "raises": "raise", "raised": "raise", "boosts": "raise", "hikes": "raise", "hiked": "raise",
+        "lowers": "lower", "lowered": "lower", "slashes": "lower", "trims": "lower",
+        "pt": "target", "targets": "target", "shares": "stock", "stocks": "stock", "says": "say", "said": "say",
+        "usd": "dollar", "dollars": "dollar", "greenback": "dollar", "wall": "wallstreet", "ahead": "before"}
+
+
+def _stem(w):
+    w = _SYN.get(w, w)
+    if len(w) > 5:
+        for suf in ("ing", "ed", "es"):
+            if w.endswith(suf):
+                return w[: -len(suf)]
+    if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+# «موضوع» خبر (دارایی یا شرکت). دو تیتر با موضوع‌های متفاوت هرگز تکراری حساب نمی‌شوند
+# (مثلاً «Gold rises 1% as dollar weakens» با «Silver rises 1% as dollar weakens»، یا انویدیا با مایکروسافت)
+_ENT_ALIAS = {"crude": "oil", "brent": "oil", "wti": "oil", "bitcoin": "btc", "sterling": "gbp", "pound": "gbp",
+              "dow jones": "dow", "djia": "dow", "xau": "gold", "xag": "silver", "s&p 500": "sp500"}
+_ENT_RX = _rx(["gold", "silver", "oil", "crude", "brent", "wti", "bitcoin", "btc", "ethereum", "nasdaq", "dow jones",
+               "dow", "djia", "s&p 500", "euro", "yen", "sterling", "pound", "xau", "xag", "canadian dollar", "loonie"]
+              + DOW30)
+
+
+def _entities(title):
+    t = _PRECLEAN.sub(" ", (title or "").lower())
+    return {"@" + _ENT_ALIAS.get(m.group(0), m.group(0)) for m in _ENT_RX.finditer(t)}
+
+
 def title_tokens(title):
-    toks = {w for w in re.findall(r"[a-z0-9$%.]+", (title or "").lower()) if w not in _STOP and len(w) > 1}
+    toks = {_stem(w) for w in re.findall(r"[a-z0-9$%.]+", (title or "").lower()) if w not in _STOP and len(w) > 1}
+    toks |= _entities(title)
     d = direction(title)
     if d > 0:
         toks.add(_UP_TOKEN)       # نشانهٔ جهت داخل مجموعهٔ واژه‌ها می‌نشیند
@@ -400,8 +461,16 @@ def is_similar(a, b, thr):
     # یک خبر صعودی و یک خبر نزولی هرگز «تکراری» نیستند، حتی اگر بقیهٔ واژه‌ها یکی باشند
     if (_UP_TOKEN in a and _DOWN_TOKEN in b) or (_DOWN_TOKEN in a and _UP_TOKEN in b):
         return False
+    ea, eb = {w for w in a if w.startswith("@")}, {w for w in b if w.startswith("@")}
+    if ea and eb and ea != eb:
+        return False
     inter = len(a & b)
-    return inter / len(a | b) >= thr or (inter >= 4 and inter / min(len(a), len(b)) >= 0.8)
+    if inter / len(a | b) >= thr or (inter >= 4 and inter / min(len(a), len(b)) >= 0.8):
+        return True
+    # یک عدد مشترک (مثل 125 یا 1.5%) + چند واژهٔ مشترک دیگر = به احتمال زیاد همان خبر با بازنویسی متفاوت
+    common = (a & b) - {_UP_TOKEN, _DOWN_TOKEN}
+    nums = {w for w in common if any(c.isdigit() for c in w) and len(w) >= 2}
+    return bool(nums) and len(common) >= 5 and inter / len(a | b) >= 0.4
 
 
 def item_keys(it):
@@ -490,7 +559,7 @@ def get_summary(cfg, it):
         return ""      # Reuters / FT / Bloomberg / Google News: فقط تیتر + لینک
     summ = make_summary(it["desc"], it["title"], cfg["summary_chars"])
     base = it["desc"]
-    use_ai = bool(cfg.get("anthropic_key"))
+    use_ai = bool(cfg.get("anthropic_key")) and cfg.get("ai_news_summary", True)
     art = it.get("_art") or ""       # معمولاً از قبل و به‌صورت هم‌زمان گرفته شده
     if (not summ or use_ai) and cfg.get("fetch_article") and it["link"] and not it.get("_nofetch"):
         if not art:
@@ -797,9 +866,14 @@ def send_telegram(token, channel, text):
 
 
 # ------------------------- استیت (دیده‌شده‌ها + تیترهای اخیر) -------------------------
+# چیزهای اضافه‌ای که در همان فایل وضعیت ذخیره می‌شوند (در GitHub Actions فقط همین یک فایل کش می‌شود)
+_STATE_EXTRA = {"analysis_sent": []}      # شناسهٔ تحلیل‌های روزانهٔ ارسال‌شده، مثل "2026-11-20 10:00"
+
+
 def load_state(path=None):
     """(seen, recent) — سازگار با فرمت قدیمی (فقط لیست کلیدها). recent = لیست مجموعهٔ واژه‌ها."""
     path = path or SEEN_FILE
+    _STATE_EXTRA["analysis_sent"] = []
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -815,6 +889,7 @@ def load_state(path=None):
     if isinstance(data, list):            # فرمت قدیمی
         return data, []
     seen = data.get("seen") or []
+    _STATE_EXTRA["analysis_sent"] = [x for x in (data.get("analysis_sent") or []) if isinstance(x, str)][-30:]
     recent = [set(t) for t in (data.get("recent") or []) if isinstance(t, list)]
     return seen, recent[-RECENT_KEEP:]
 
@@ -823,6 +898,7 @@ def save_state(seen, recent, path=None):
     path = path or SEEN_FILE
     payload = {"version": STATE_VERSION,
                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "analysis_sent": _STATE_EXTRA["analysis_sent"][-30:],
                "seen": seen[-SEEN_KEEP:],
                "recent": [sorted(t) for t in recent[-RECENT_KEEP:]]}
     tmp = path + ".tmp"
@@ -981,6 +1057,238 @@ def run_cycle(cfg, seen, post_fn, get_feed=None, first=False, backfill=0, recent
     return sent
 
 
+# ------------------------- تحلیل فاندامنتال روزانه -------------------------
+# (کلید، ایموجی، نام فارسی، واژه‌های جست‌وجو در تیترها)
+ANALYSIS_ASSETS = [
+    ("gold",   "🟡", "طلا",          CATS["gold"][3]),
+    ("silver", "⚪", "نقره",         CATS["silver"][3]),
+    ("nasdaq", "💻", "نزدک",         CATS["nasdaq"][3]),
+    ("dow",    "📊", "داو جونز",     ["dow jones", "dow", "djia", "wall street", "s&p 500", "stock market", "stocks"]),
+    ("oil",    "🛢️", "نفت",          CATS["oil"][3]),
+    ("btc",    "🟠", "بیت‌کوین",     CATS["btc"][3]),
+    ("usd",    "💵", "دلار آمریکا",  CATS["usd"][3]),
+    ("gbp",    "💷", "پوند",         CATS["gbp"][3]),
+    ("cad",    "🍁", "دلار کانادا",  ["canadian dollar", "loonie", "usd/cad", "usdcad", "cad", "bank of canada", "canadian economy"]),
+]
+ANALYSIS_RX = {k: _rx(w) for k, _e, _n, w in ANALYSIS_ASSETS}
+# عوامل عمومیِ اثرگذار روی همهٔ دارایی‌ها (فد، تورم، بازدهی، ترس بازار، ژئوپلیتیک)
+DRIVER_RX = _rx(CATS["macro"][3] + CATS["bond"][3] + CATS["vix"][3] + CATS["war"][3])
+TG_MAX = 3800            # سقف امن طول هر پیام تلگرام (حد واقعی ۴۰۹۶)
+_analysis_fails = {}
+
+
+def tz_now(tzname, now=None):
+    """زمان فعلی در منطقهٔ زمانی داده‌شده (اگر zoneinfo نبود، افست ثابت)."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return now.astimezone(ZoneInfo(tzname))
+    except Exception:
+        fx = _FIXED_TZ.get((tzname or "").strip().lower(), (3, 30))
+        return now.astimezone(timezone(timedelta(hours=fx[0], minutes=fx[1])))
+
+
+def due_analysis_slot(cfg, sent, now=None):
+    """(شناسهٔ نوبت یا None, زمان محلی). نوبت وقتی «سررسید» است که ساعتش رسیده، هنوز ارسال نشده و از grace نگذشته باشد."""
+    loc = tz_now(cfg.get("analysis_tz") or "Asia/Tehran", now)
+    grace = int(cfg.get("analysis_grace_minutes", 90))
+    due = None
+    for t in sorted(str(x) for x in cfg.get("analysis_times", [])):
+        try:
+            hh, mm = (int(v) for v in t.split(":"))
+            slot = loc.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except ValueError:
+            continue
+        sid = slot.strftime("%Y-%m-%d %H:%M")
+        if sid not in sent and 0 <= (loc - slot).total_seconds() < grace * 60:
+            due = sid
+    return due, loc
+
+
+def claude_text(cfg, system, user, max_tokens=3500, model=None, web_search=False, timeout=180):
+    """یک پرسش به Claude؛ متن پاسخ را برمی‌گرداند."""
+    body = {"model": model or cfg["ai_model"], "max_tokens": max_tokens, "system": system,
+            "messages": [{"role": "user", "content": user}]}
+    if web_search:
+        body["tools"] = [{"type": "web_search_20250305", "name": "web_search",
+                          "max_uses": int(cfg.get("analysis_web_searches", 6))}]
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(body).encode("utf-8"),
+                                 headers={"x-api-key": cfg["anthropic_key"], "anthropic-version": "2023-06-01",
+                                          "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"Anthropic HTTP {e.code}: {msg[:160]}")
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+def collect_headlines(cfg, get_feed=None, hours=24, now=None):
+    """تیترهای `hours` ساعت اخیر از همهٔ فیدها (بدون توجه به seen). خروجی: [{title, src, date}] تازه‌ترین اول."""
+    get_feed = get_feed or (lambda url: parse_feed(fetch(url)))
+    now = now or datetime.now(timezone.utc)
+    feeds = list(FEEDS) + [tuple(x) for x in cfg.get("extra_feeds", []) if len(x) == 2]
+    if not cfg.get("use_google_news", True):
+        feeds = [f for f in feeds if "news.google.com" not in f[1]]
+
+    def _load(nu):
+        try:
+            return nu, get_feed(nu[1])
+        except Exception:      # noqa
+            return nu, []
+
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("fetch_workers", 8)))) as pool:
+        loaded = list(pool.map(_load, feeds))
+    out, toks = [], []
+    for (name, url), items in loaded:
+        is_gn = "news.google.com" in url
+        for it in items:
+            title, src = it["title"], name
+            if is_gn:
+                m = re.search(r"\s+[-–—]\s+([^-–—]{2,40})$", title)
+                if m:
+                    src, title = m.group(1).strip(), title[:m.start()].strip()
+            d = it.get("date")
+            if not d or not (-10 <= (now - d).total_seconds() / 60 <= hours * 60):
+                continue
+            t = title_tokens(title)
+            if any(is_similar(t, o, 0.6) for o in toks):
+                continue
+            toks.append(t)
+            out.append({"title": title, "src": src, "date": d})
+    out.sort(key=lambda x: x["date"], reverse=True)
+    return out
+
+
+def _fmt_headline(h, now):
+    hrs = max(0, (now - h["date"]).total_seconds() / 3600)
+    return f"- [{hrs:.0f}h ago | {h['src']}] {h['title']}"
+
+
+def build_analysis_prompt(cfg, heads, loc, now=None):
+    now = now or datetime.now(timezone.utc)
+    per = int(cfg.get("analysis_headlines_per_asset", 8))
+    parts = [f"Current time: {loc.strftime('%Y-%m-%d %H:%M')} ({cfg.get('analysis_tz') or 'Asia/Tehran'})"]
+    for key, _e, _n, _w in ANALYSIS_ASSETS:
+        rx = ANALYSIS_RX[key]
+        rel = [h for h in heads if rx.search(_PRECLEAN.sub(" ", h["title"]))][:per]
+        parts.append(f"\n=== {key} ===\n" + ("\n".join(_fmt_headline(h, now) for h in rel) if rel else "(no recent headlines)"))
+    drv = [h for h in heads if DRIVER_RX.search(_PRECLEAN.sub(" ", h["title"]))][:per + 4]
+    parts.append("\n=== drivers (Fed, inflation, yields, geopolitics, volatility) ===\n"
+                 + ("\n".join(_fmt_headline(h, now) for h in drv) if drv else "(no recent headlines)"))
+    return "\n".join(parts)
+
+
+def analysis_system(cfg):
+    keys = " ".join(k for k, _e, _n, _w in ANALYSIS_ASSETS)
+    web = (" اگر ابزار جستجوی وب در اختیارت است، برای هر دارایی قیمت و خبر همین امروز را هم بررسی کن و فقط اعدادی بنویس که در منبع دیده‌ای."
+           if cfg.get("analysis_web_search") else
+           " فقط از روی تیترهای داده‌شده بنویس و هیچ قیمت یا سطح عددی از خودت نساز؛ فقط اعدادی که در تیترها آمده‌اند مجازند.")
+    return ("تو تحلیلگر فاندامنتال یک کانال فارسی‌زبان بازارهای مالی هستی." + web +
+            " برای هر دارایی ۲ تا ۴ جمله بنویس: مهم‌ترین عوامل بنیادی (سیاست پولی فد و بانک‌های مرکزی، تورم و داده‌های اقتصادی، "
+            "بازدهی اوراق، قدرت دلار، عرضه و تقاضا، ژئوپلیتیک و ...) و در پایان سوگیری کوتاه‌مدت را با یکی از واژه‌های "
+            "«صعودی»، «نزولی» یا «خنثی» و دلیل کوتاه بگو. اگر برای دارایی خبر تازهٔ مهمی نبود، همین را صریح بنویس و فقط "
+            "عوامل بنیادی پایدار آن را در یک یا دو جمله بگو. اطلاعات اضافی را حدس نزن. توصیهٔ خرید و فروش نده. "
+            "فارسی روان بنویس؛ نام‌هایی مثل Fed و OPEC را می‌توانی انگلیسی بنویسی. "
+            f"قالب خروجی دقیقاً این است: برای هر دارایی یک خط جدا به شکل «### کلید» و زیرش متن تحلیل. کلیدها به همین ترتیب: {keys} "
+            "و در آخر «### summary» با جمع‌بندی ۲ تا ۳ جمله‌ای از وضعیت کلی بازار. از مارک‌داون و ستاره (*) استفاده نکن.")
+
+
+def parse_analysis(text):
+    """متن Claude را به {کلید: متن} تبدیل می‌کند؛ هر چیز قبل از اولین ### نادیده گرفته می‌شود."""
+    parts = re.split(r"(?m)^\s*###\s*([A-Za-z_]+)\s*$", text)
+    return {parts[i].lower(): parts[i + 1].strip() for i in range(1, len(parts) - 1, 2) if parts[i + 1].strip()}
+
+
+def fix_rtl_lines(text):
+    return "\n".join(fix_rtl(l) for l in text.split("\n"))
+
+
+def format_analysis(sections, loc, cfg):
+    """بلوک‌ها را به پیام‌های کمتر از TG_MAX کاراکتر بسته‌بندی می‌کند (HTML تلگرام، راست‌به‌چپ)."""
+    head = f"{RLM}📅 <b>تحلیل فاندامنتال بازار</b> | {loc.strftime('%Y-%m-%d')} ساعت {loc.strftime('%H:%M')}"
+    blocks = [head]
+    for key, emoji, name, _w in ANALYSIS_ASSETS:
+        if key in sections:
+            blocks.append(f"{RLM}{emoji} <b>{esc(name)}</b>\n{esc(fix_rtl_lines(sections[key]))}")
+    if "summary" in sections:
+        blocks.append(f"{RLM}🧭 <b>جمع‌بندی</b>\n{esc(fix_rtl_lines(sections['summary']))}")
+    blocks.append(f"{RLM}⚠️ این تحلیل خودکار و بر پایهٔ خبرهای ۲۴ ساعت اخیر است و توصیهٔ خرید یا فروش نیست.")
+    msgs, cur = [], ""
+    for b in blocks:
+        b = b[:TG_MAX]
+        if cur and len(cur) + 2 + len(b) > TG_MAX:
+            msgs.append(cur)
+            cur = b
+        else:
+            cur = f"{cur}\n\n{b}" if cur else b
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+
+def run_analysis(cfg, post_fn, loc, get_feed=None, ask_fn=None, now=None):
+    """تحلیل را می‌سازد و می‌فرستد. خروجی: تعداد پیام‌های ارسال‌شده. در خطای ساخت/ارسال پیام اول، استثنا می‌دهد."""
+    now = now or datetime.now(timezone.utc)
+    ask_fn = ask_fn or (lambda system, user: claude_text(
+        cfg, system, user, model=cfg.get("analysis_model") or cfg["ai_model"],
+        web_search=bool(cfg.get("analysis_web_search"))))
+    heads = collect_headlines(cfg, get_feed, now=now)
+    log(f"تحلیل روزانه: {len(heads)} تیتر ۲۴ ساعت اخیر جمع شد.")
+    text = ask_fn(analysis_system(cfg), build_analysis_prompt(cfg, heads, loc, now))
+    sections = parse_analysis(text)
+    if len([k for k in sections if k != "summary"]) < 3:
+        raise RuntimeError("پاسخ Claude قالب درست نداشت (کمتر از ۳ دارایی تحلیل شده بود).")
+    sent = 0
+    for m in format_analysis(sections, loc, cfg):
+        try:
+            post_fn(m)
+        except Exception as e:     # noqa
+            if sent == 0:
+                raise
+            log(f"⚠ بخشی از تحلیل ارسال نشد: {str(e)[:100]}")
+            break
+        sent += 1
+        time.sleep(2)
+    return sent
+
+
+def maybe_analysis(cfg, post_fn, save_fn=None, force=False, get_feed=None, ask_fn=None, now=None):
+    """اگر نوبت تحلیل روزانه رسیده بود (و قبلاً ارسال نشده)، آن را می‌فرستد. خروجی: تعداد پیام‌ها."""
+    if not force and not cfg.get("analysis_enabled", True):
+        return 0
+    sent_list = _STATE_EXTRA["analysis_sent"]
+    slot, loc = due_analysis_slot(cfg, sent_list, now)
+    if force:
+        slot = loc.strftime("%Y-%m-%d %H:%M") + " manual"
+    if not slot:
+        return 0
+    if not cfg.get("anthropic_key"):
+        if "analysis_nokey" not in _warned:
+            log("⚠ تحلیل روزانه نیاز به کلید Anthropic دارد (ANTHROPIC_API_KEY)؛ فعلاً ارسال نمی‌شود.")
+            _warned.add("analysis_nokey")
+        return 0
+    if _analysis_fails.get(slot, 0) >= 3:
+        return 0               # چند بار ناموفق بود؛ برای همین نوبت دیگر هزینه نمی‌کنیم
+    try:
+        n = run_analysis(cfg, post_fn, loc, get_feed=get_feed, ask_fn=ask_fn, now=now)
+    except Exception as e:     # noqa
+        _analysis_fails[slot] = _analysis_fails.get(slot, 0) + 1
+        log(f"تحلیل روزانه ناموفق ({_analysis_fails[slot]}/3): {str(e)[:140]}")
+        return 0
+    if n and not force:
+        sent_list.append(slot)
+        del sent_list[:-30]
+        if save_fn:
+            save_fn()
+    log(f"تحلیل روزانه ارسال شد ({n} پیام).")
+    return n
+
+
 # ------------------------- اجرا -------------------------
 def main():
     global _LOG_FILE, _LOG_MAX
@@ -991,6 +1299,8 @@ def main():
     ap.add_argument("--setup", action="store_true", help="اجرای دوبارهٔ جادوگر راه‌اندازی (توکن/کانال)")
     ap.add_argument("--once", action="store_true", help="فقط یک دور بررسی و خروج (برای cron)")
     ap.add_argument("--test-ai", action="store_true", help="تست کلید و نام مدل Anthropic")
+    ap.add_argument("--analysis-now", action="store_true",
+                    help="تحلیل فاندامنتال را همین الان بساز و بفرست (با --dry-run فقط چاپ می‌کند)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -1011,6 +1321,18 @@ def main():
         except Exception as e:
             sys.exit(f"❌ تست ناموفق: {e}\n   اگر خطا 404 است، نام ai_model را بررسی کن (پیش‌فرض: {DEFAULTS['ai_model']}).")
         print("✅ مدل پاسخ داد:", out or "(NONE)")
+
+    if a.analysis_now:
+        if not cfg.get("anthropic_key"):
+            sys.exit("تحلیل به کلید Anthropic نیاز دارد. ANTHROPIC_API_KEY را ست کن یا در news_config.json بگذار.")
+        if a.dry_run:
+            post_a = lambda m: print("-" * 50 + "\n" + re.sub(r"<[^>]+>", "", html.unescape(m)))  # noqa
+        elif not cfg["token"] or not cfg["channel"]:
+            sys.exit("token یا channel خالی است (برای فقط چاپ، --dry-run هم بگذار).")
+        else:
+            post_a = lambda m: send_telegram(cfg["token"], cfg["channel"], m)  # noqa
+        n = maybe_analysis(cfg, post_a, force=True)
+        sys.exit(0 if n else 1)
 
     if a.dry_run:
         def post(m):
@@ -1059,6 +1381,8 @@ def main():
             n = run_cycle(cfg, seen, post, first=first, backfill=a.backfill, recent=recent, save_fn=save)
             save_state(seen, recent)
             log(f"{n} خبر ارسال شد.")
+            maybe_analysis(cfg, post, save_fn=save)      # تحلیل روزانه (فقط اگر نوبتش رسیده باشد)
+            save_state(seen, recent)
         except KeyboardInterrupt:
             save_state(seen, recent)
         except Exception as e:  # noqa
@@ -1076,6 +1400,7 @@ def main():
             save_state(seen, recent)
             if n:
                 log(f"{n} خبر ارسال شد.")
+            maybe_analysis(cfg, post, save_fn=save)      # تحلیل روزانه (فقط اگر نوبتش رسیده باشد)
         except KeyboardInterrupt:
             save_state(seen, recent)
             log("متوقف شد.")
@@ -1141,6 +1466,53 @@ def selftest():
     assert not is_similar(up, dn, 0.6), "خبر صعودی و نزولی نباید تکراری حساب شود"
     assert is_similar(title_tokens("Gold jumps as CPI cools"), title_tokens("Gold jumps as CPI cools today"), 0.6)
     assert not is_similar(up, title_tokens("Microsoft earnings beat estimates"), 0.6)
+
+    # --- تحلیل روزانه: نوبت‌ها، جمع‌آوری تیتر، قالب‌بندی، ارسال یکبار در هر نوبت ---
+    acfg = dict(DEFAULTS, analysis_enabled=True, anthropic_key="k", ai_model="m")
+    utc = lambda h, m: datetime(2026, 11, 20, h, m, tzinfo=timezone.utc)      # تهران = UTC+3:30
+    assert due_analysis_slot(acfg, [], utc(6, 30))[0] == "2026-11-20 10:00"    # ۱۰:۰۰ تهران
+    assert due_analysis_slot(acfg, [], utc(6, 29))[0] is None                  # یک دقیقه زود
+    assert due_analysis_slot(acfg, [], utc(7, 59))[0] == "2026-11-20 10:00"    # هنوز در مهلت ۹۰ دقیقه
+    assert due_analysis_slot(acfg, [], utc(8, 0))[0] is None                   # مهلت تمام شد
+    assert due_analysis_slot(acfg, [], utc(11, 30))[0] == "2026-11-20 15:00"   # ۱۵:۰۰ تهران
+    assert due_analysis_slot(acfg, ["2026-11-20 10:00"], utc(6, 40))[0] is None  # قبلاً ارسال شده
+    heads_now = datetime.now(timezone.utc)
+    titles = ["Gold climbs as Fed rate-cut bets build", "Silver rallies with gold", "Nasdaq slips as chip stocks fall",
+              "Dow Jones closes higher on Wall Street", "Oil jumps on OPEC+ supply cut", "Bitcoin drops below $90,000",
+              "Dollar index steadies before CPI", "Pound sterling slips after Bank of England signals cuts",
+              "Canadian dollar edges up as Bank of Canada holds rates", "Old gold story from last week"]
+    fake_items = [{"title": t, "date": heads_now - timedelta(hours=(200 if "Old" in t else 2)), "desc": "", "link": ""}
+                  for t in titles]
+    heads = collect_headlines(acfg, get_feed=lambda url: list(fake_items), now=heads_now)
+    assert len(heads) == len(titles) - 1 and all("Old" not in h["title"] for h in heads)      # تکراری فیدها یکی شد، خبر قدیمی حذف
+    prompt = build_analysis_prompt(acfg, heads, tz_now("Asia/Tehran", utc(6, 30)), heads_now)
+    assert "=== cad ===" in prompt and "Canadian dollar edges up" in prompt and "Old gold story" not in prompt
+    fake_ai = "\n".join(f"### {k}\nتحلیل نمونهٔ {k}؛ Fed و تورم مهم‌اند & سوگیری خنثی." for k, *_ in ANALYSIS_ASSETS) + "\n### summary\nجمع‌بندی نمونه."
+    secs = parse_analysis("مقدمهٔ اضافه\n" + fake_ai)
+    assert set(secs) == {k for k, *_ in ANALYSIS_ASSETS} | {"summary"}
+    msgs = format_analysis(secs, tz_now("Asia/Tehran", utc(6, 30)), acfg)
+    assert msgs and all(len(m) <= 4096 for m in msgs) and "&amp;" in msgs[0] and "دلار کانادا" in "".join(msgs)
+    assert "&amp<" not in "".join(msgs).replace(RLM, "<")       # نویسهٔ RLM وسط موجودیت HTML نیفتاده
+    long_secs = {k: "کلمه " * 300 for k, *_ in ANALYSIS_ASSETS}
+    assert all(len(m) <= 4096 for m in format_analysis(long_secs, tz_now("Asia/Tehran", utc(6, 30)), acfg))
+    posted, calls = [], []
+    _STATE_EXTRA["analysis_sent"] = []
+    ask = lambda system, user: (calls.append(1), fake_ai)[1]
+    n1 = maybe_analysis(acfg, posted.append, save_fn=lambda: None, get_feed=lambda u: list(fake_items), ask_fn=ask, now=utc(6, 40))
+    n2 = maybe_analysis(acfg, posted.append, save_fn=lambda: None, get_feed=lambda u: list(fake_items), ask_fn=ask, now=utc(6, 50))
+    assert n1 >= 1 and n2 == 0 and len(calls) == 1, (n1, n2, calls)      # در هر نوبت فقط یک‌بار
+    assert _STATE_EXTRA["analysis_sent"] == ["2026-11-20 10:00"]
+    st = os.path.join(tempfile.mkdtemp(), "st.json")
+    save_state([], [], st)
+    _STATE_EXTRA["analysis_sent"] = []
+    load_state(st)
+    assert _STATE_EXTRA["analysis_sent"] == ["2026-11-20 10:00"]            # در فایل وضعیت ذخیره و برگردانده می‌شود
+    assert maybe_analysis(dict(acfg, anthropic_key=""), posted.append, get_feed=lambda u: [], ask_fn=ask, now=utc(11, 40)) == 0
+    assert maybe_analysis(dict(acfg, analysis_enabled=False), posted.append, get_feed=lambda u: [], ask_fn=ask, now=utc(11, 40)) == 0
+    bad = lambda system, user: "فقط یک متن بدون قالب"
+    assert maybe_analysis(acfg, posted.append, get_feed=lambda u: [], ask_fn=bad, now=utc(11, 40)) == 0     # قالب خراب = ارسال نمی‌شود
+    assert "2026-11-20 15:00" not in _STATE_EXTRA["analysis_sent"]                                       # و علامت «ارسال‌شده» نمی‌خورد
+    _STATE_EXTRA["analysis_sent"] = []
 
     # --- ساعت به وقت تهران، مستقل از ساعت سیستم (مثلاً UTC در گیت‌هاب) ---
     assert local_time(datetime(2026, 11, 19, 14, 30, tzinfo=timezone.utc), "Asia/Tehran") == "18:00"
