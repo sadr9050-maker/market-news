@@ -63,7 +63,7 @@ SEND_MAX_FAILS = 5      # بعد از این تعداد خطای ارسال، خ
 DEFAULTS = {
     "token": "",                 # توکن ربات تلگرام
     "channel": "",               # مثل @mychannel یا -100123456789
-    "poll_seconds": 120,         # هر چند ثانیه فیدها چک شود
+    "poll_seconds": 60,          # هر چند ثانیه فیدها چک شود
     "max_per_cycle": 8,          # حداکثر پیام در هر دور (برای جلوگیری از اسپم)
     "max_age_minutes": 20,       # فقط خبرهای همین چند دقیقهٔ اخیر منتشر می‌شوند (خبر بدون تاریخ منتشر نمی‌شود)
     "high_max_age_minutes": 90,  # خبرهای «مهم» پنجرهٔ بلندتری دارند تا در شلوغی بازار از دست نروند
@@ -151,6 +151,8 @@ FEEDS = [
     ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=GBPUSD=X&region=US&lang=en-US"),
     ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=USDCAD=X&region=US&lang=en-US"),
     ("Yahoo Finance", "https://news.google.com/rss/search?q=when:1d+site:finance.yahoo.com/economy&hl=en-US&gl=US&ceid=US:en"),
+    # --- Forex Factory (فید رسمی ندارد؛ از جستجوی Google News استفاده می‌شود، فقط تیتر + لینک) ---
+    ("Forex Factory",        "https://news.google.com/rss/search?q=when:1d+site:forexfactory.com&ceid=US:en&hl=en-US&gl=US"),
     # --- Bloomberg ---
     ("Bloomberg",            "https://feeds.bloomberg.com/markets/news.rss"),
     ("Bloomberg Economics",  "https://feeds.bloomberg.com/economics/news.rss"),
@@ -199,6 +201,11 @@ CATS = {
     "war":    ("⚔️", "جنگ و ژئوپلیتیک", "#ژئوپلیتیک", ["iran", "iranian", "tehran", "hormuz", "strait of hormuz", "sanctions",
                                                   "war", "ceasefire", "missile", "missiles", "airstrike", "airstrikes", "military",
                                                   "middle east", "israel", "geopolitical", "geopolitics", "escalation", "pentagon"]),
+    # چهره‌های اثرگذار بر بازار؛ نام کامل می‌آید تا خبرهای نامرتبط وارد نشوند
+    # («trump» عمداً نیامده چون تقریباً همهٔ خبرهای سیاسی را وارد می‌کند؛ اگر خواستی خودت اضافه کن)
+    "people": ("👤", "چهره‌های بازار", "#چهره_بازار", ["jensen huang", "elon musk", "tim cook", "satya nadella", "sam altman",
+                                                  "warren buffett", "jamie dimon", "larry fink", "scott bessent", "bessent",
+                                                  "lisa su", "mark zuckerberg", "sundar pichai", "cathie wood"]),
 }
 # واژه‌های «عام» که با «مهم» اشتباه می‌شدند حذف شدند: attack / default
 HIGH = ["treasury auction", "treasury refunding", "term premium", "debt ceiling", "bond selloff", "bond sell-off",
